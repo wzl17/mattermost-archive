@@ -689,6 +689,11 @@ async function runSearch(more) {
                                   system: $("#system").checked ? 1 : ""});
   } catch (e) { view.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
   if (seq !== searchSeq) return;
+  if (!more) {  // keep the search in the address, so reloads and links reopen it
+    const h = new URLSearchParams({search: $("#q").value.trim()});
+    for (const k of ["user", "from", "to", "sort"]) if ($("#" + k).value && !(k === "sort" && $("#sort").value === "new")) h.set(k, $("#" + k).value);
+    setHash(h.toString());
+  }
   const rows = d.results.map(r => {
     const name = displayName(r.user_id, r.override_username);
     const snip = esc(r.snippet).replace(/\u0002/g, "<mark>").replace(/\u0003/g, "</mark>")
@@ -804,6 +809,13 @@ async function route() {
   const h = new URLSearchParams(location.hash.slice(1));
   if (h.get("p")) await goTo(h.get("p"));
   else if (location.hash === "#files") await showFiles();
+  else if (h.has("search")) {
+    $("#q").value = h.get("search");
+    for (const k of ["user", "from", "to"]) $("#" + k).value = h.get(k) || "";
+    $("#sort").value = h.get("sort") || "new";
+    if (filtersActive()) await runSearch();
+    else await showMonth(S.months.at(-1));
+  }
   else await showMonth(S.months.includes(h.get("m")) ? h.get("m") : S.months.at(-1));
 }
 </script>

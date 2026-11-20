@@ -7,6 +7,14 @@ Three scripts, plain Python 3 (no installs needed):
 - `mm_viewer.py` lets you browse and search that archive in your web browser.
 - `mm_share.py` packs the archive into one clean .zip that others can unzip and browse.
 
+## Preview
+
+The viewer, showing made-up sample data:
+
+![A month of conversations with a thread expanded, an inline image and a code snippet](docs/viewer-conversation.png)
+
+![Search results for "helium" with matches highlighted](docs/viewer-search.png)
+
 ## 0. Set up (once)
 
 The scripts need Python 3.9 or newer and nothing else. The project keeps its own virtual
@@ -57,7 +65,8 @@ python3 mm_viewer.py archive
 
 Your browser opens on the latest month. Pick months on the left, expand threads,
 search (press `/`), filter by person or dates, or open **Files** to see every attachment.
-Clicking a search result or file shows it in its conversation. Stop with Ctrl-C.
+Clicking a search result or file shows it in its conversation. The address bar keeps your
+place, so you can bookmark a month, a message or a search. Stop with Ctrl-C.
 
 The viewer is only reachable from your own computer and never changes the archive.
 
