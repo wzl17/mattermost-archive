@@ -1,0 +1,19 @@
+# Channel archives are private chat data: never commit them.
+# (mm_archive.py also puts its own .gitignore inside every archive folder it creates,
+# so archives saved under other --out names are ignored too.)
+archive/
+archive*/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.part
+*.zip
+
+# Local Python environment and caches
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
