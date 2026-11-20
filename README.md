@@ -106,3 +106,7 @@ SELECT substr(time, 1, 4) AS year, user, COUNT(*) FROM messages GROUP BY 1, 2;
 - Only what your account can see: deleted messages and earlier versions of edited messages
   aren't available to non-admins.
 - Private channels: you must be a member.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -31,7 +31,8 @@ import zipfile
 from datetime import date
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CODE_FILES = ["README.md", ".gitignore", "mm_archive.py", "mm_viewer.py", "mm_share.py"]
+CODE_FILES = ["README.md", "LICENSE", ".gitignore", "mm_archive.py", "mm_viewer.py",
+              "mm_share.py"]
 # Already-compressed formats: store as-is (compressing again only costs time).
 STORED = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".mp4", ".mov", ".m4v",
           ".mp3", ".m4a", ".zip", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
