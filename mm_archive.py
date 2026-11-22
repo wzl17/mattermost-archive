@@ -35,11 +35,12 @@ import re
 import shutil
 import sqlite3
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from http.client import HTTPException
 
@@ -124,34 +125,59 @@ class ApiError(Exception):
         self.code = code
 
 
+class Stopped(Exception):
+    """Ctrl-C was pressed; worker threads unwind with this."""
+
+
 class Client:
     def __init__(self, base_url, token):
         self.base = base_url.rstrip("/") + "/api/v4"
         self.token = token
 
-    def _open(self, method, path, body=None):
+        self.stop = threading.Event()  # set on Ctrl-C so download threads quit
+
+    def pause(self, seconds):
+        if self.stop.wait(seconds):
+            raise Stopped()
+
+    def _open(self, method, path, body=None, headers=None, tries=10, timeout=120):
         """Send a request, waiting out rate limits and retrying network errors."""
         url = self.base + path
         data = json.dumps(body).encode() if body is not None else None
-        for attempt in range(10):
+        problem = ""
+        for attempt in range(tries):
+            if self.stop.is_set():
+                raise Stopped()
             req = urllib.request.Request(url, data=data, method=method)
             req.add_header("Authorization", f"Bearer {self.token}")
             req.add_header("X-Requested-With", "XMLHttpRequest")
             if data is not None:
                 req.add_header("Content-Type", "application/json")
+            for k, v in (headers or {}).items():
+                req.add_header(k, v)
             try:
-                return urllib.request.urlopen(req, timeout=120)
+                return urllib.request.urlopen(req, timeout=timeout)
             except urllib.error.HTTPError as e:
+                detail = e.read().decode(errors="replace")
+                e.close()
                 if e.code == 429 or e.code >= 500:
                     reset = e.headers.get("X-RateLimit-Reset")
                     wait = int(reset) if reset and reset.isdigit() else 2 ** attempt
-                    time.sleep(min(max(wait, 1), 60))
+                    wait = min(max(wait, 1), 60)
+                    problem = f"HTTP {e.code}: {detail[:200]}"
+                    if attempt < tries - 1:
+                        log(f"  server answered HTTP {e.code} for {path}; "
+                            f"retrying in {wait}s ({attempt + 1}/{tries - 1})")
+                        self.pause(wait)
                     continue
-                raise ApiError(e.code, method, path, e.read().decode(errors="replace"))
+                raise ApiError(e.code, method, path, detail)
             except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-                log(f"  network problem ({e}); retrying...")
-                time.sleep(min(2 ** attempt, 60))
-        raise SystemExit(f"{method} {path}: giving up after repeated failures")
+                problem = str(e)
+                if attempt < tries - 1:
+                    wait = min(2 ** attempt, 60)
+                    log(f"  network problem ({e}); retrying in {wait}s...")
+                    self.pause(wait)
+        raise ApiError(0, method, path, f"giving up after {tries} tries ({problem})")
 
     def get(self, path):
         with self._open("GET", path) as r:
@@ -161,20 +187,33 @@ class Client:
         with self._open("POST", path, body) as r:
             return json.loads(r.read())
 
-    def download(self, path, dest):
-        """Stream a file to disk; retries if the connection drops midway."""
+    def download(self, path, dest, expected=None, on_bytes=None):
+        """Stream a file to disk, starting it over if the connection drops. A file
+        only counts as downloaded once all of its bytes have arrived."""
         tmp = dest + ".part"
         for attempt in range(5):
             try:
-                with self._open("GET", path) as r, open(tmp, "wb") as f:
+                with self._open("GET", path, tries=4, timeout=60) as r, \
+                        open(tmp, "wb") as f:
+                    length = r.headers.get("Content-Length")
+                    total = int(length) if length and length.isdigit() else expected
                     while chunk := r.read(1 << 20):
+                        if self.stop.is_set():
+                            raise Stopped()
                         f.write(chunk)
+                        if on_bytes:
+                            on_bytes(len(chunk))
+                size = os.path.getsize(tmp)
+                if total and size < total:
+                    raise ConnectionError(f"connection closed after {human(size)} "
+                                          f"of {human(total)}")
                 os.replace(tmp, dest)
                 return
             except (OSError, HTTPException) as e:
                 if attempt == 4:
                     raise ApiError(0, "GET", path, f"download failed: {e}")
-                time.sleep(2 ** attempt)
+                log(f"  {os.path.basename(dest)}: {e}; starting it again...")
+                self.pause(2 ** attempt)
 
 
 def q(s):
@@ -294,7 +333,9 @@ def fetch_users(c, db):
 
 def fetch_file_infos(c, db):
     missing = [r[0] for r in db.execute("SELECT id FROM files WHERE name IS NULL")]
-    for fid in missing:
+    if missing:
+        log(f"  looking up details of {len(missing)} attachments")
+    for i, fid in enumerate(missing, 1):
         try:
             f = c.get(f"/files/{fid}/info")
             db.execute("""UPDATE files SET name=?, extension=?, mime_type=?, size=?,
@@ -303,6 +344,9 @@ def fetch_file_infos(c, db):
                         f.get("size"), f.get("width"), f.get("height"), fid))
         except ApiError as e:
             db.execute("UPDATE files SET error=? WHERE id=?", (str(e), fid))
+        if i % 100 == 0:
+            db.commit()
+            log(f"  {i}/{len(missing)} looked up")
     db.commit()
 
 
@@ -313,49 +357,94 @@ def human(n):
         n /= 1024
 
 
+def recheck_downloaded(db, out):
+    """Earlier versions could keep a file cut short by a dropped connection.
+    Queue any downloaded file that is smaller than the server said for download."""
+    bad = []
+    for fid, rel, size in db.execute(
+            "SELECT id, path, size FROM files WHERE path IS NOT NULL AND size > 0"):
+        p = os.path.join(out, rel)
+        if not os.path.exists(p) or os.path.getsize(p) < size:
+            bad.append((fid, p))
+    for fid, p in bad:
+        if os.path.exists(p):
+            os.remove(p)
+        db.execute("UPDATE files SET path=NULL WHERE id=?", (fid,))
+    db.commit()
+    if bad:
+        log(f"  {len(bad)} attachments from earlier runs are incomplete or missing; "
+            f"downloading them again")
+
+
 def download_files(c, db, out, workers):
+    recheck_downloaded(db, out)
     rows = db.execute("SELECT id, name, create_at, size FROM files "
                       "WHERE path IS NULL ORDER BY create_at").fetchall()
     if not rows:
         log("  all attachments already downloaded")
         return
-    need = sum(r[3] or 0 for r in rows)
-    free = shutil.disk_usage(out).free
-    log(f"  {len(rows)} to download, about {human(need)} ({human(free)} free on disk)")
-    if need > free:
-        raise SystemExit("Not enough disk space for the attachments. Free some space, "
-                         "or run with --no-files to export only the messages.")
 
     jobs = {}
-    for fid, name, create_at, _ in rows:
+    for fid, name, create_at, size in rows:
         d = datetime.fromtimestamp((create_at or 0) / 1000, tz=timezone.utc)
         rel = f"files/{d:%Y}/{d:%m}/{fid}_{safe_name(name or fid)}"
         dest = os.path.join(out, rel)
-        if os.path.exists(dest):
+        if os.path.exists(dest) and os.path.getsize(dest) >= (size or 0):
             db.execute("UPDATE files SET path=?, error=NULL WHERE id=?", (rel, fid))
             continue
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        jobs[fid] = (rel, dest)
+        jobs[fid] = (rel, dest, size)
     db.commit()
+    if not jobs:
+        log("  all attachments already downloaded")
+        return
+    need = sum(j[2] or 0 for j in jobs.values())
+    free = shutil.disk_usage(out).free
+    log(f"  {len(jobs)} to download, about {human(need)} ({human(free)} free on disk)")
+    if need > free:
+        raise SystemExit("Not enough disk space for the attachments. Free some space, "
+                         "or run with --no-files to export only the messages.")
+    for rel, _, size in sorted(jobs.values(), key=lambda j: -(j[2] or 0))[:5]:
+        if (size or 0) >= 50 << 20:
+            log(f"  large file: {os.path.basename(rel)} ({human(size)})")
+
+    lock = threading.Lock()
+    received = [0]
+
+    def on_bytes(n):
+        with lock:
+            received[0] += n
 
     done = failed = 0
+    started = last_log = time.monotonic()
     ex = ThreadPoolExecutor(max_workers=workers)
     try:
-        futures = {ex.submit(c.download, f"/files/{fid}", dest): (fid, rel)
-                   for fid, (rel, dest) in jobs.items()}
-        for fut in as_completed(futures):
-            fid, rel = futures[fut]
-            try:
-                fut.result()
-                db.execute("UPDATE files SET path=?, error=NULL WHERE id=?", (rel, fid))
-                done += 1
-            except ApiError as e:
-                db.execute("UPDATE files SET error=? WHERE id=?", (str(e), fid))
-                failed += 1
-                log(f"  could not download {rel}: {e}")
-            if (done + failed) % 25 == 0:
+        futures = {ex.submit(c.download, f"/files/{fid}", dest, size, on_bytes): (fid, rel)
+                   for fid, (rel, dest, size) in jobs.items()}
+        pending = set(futures)
+        while pending:
+            finished, pending = wait(pending, timeout=5, return_when=FIRST_COMPLETED)
+            for fut in finished:
+                fid, rel = futures[fut]
+                try:
+                    fut.result()
+                    db.execute("UPDATE files SET path=?, error=NULL WHERE id=?", (rel, fid))
+                    done += 1
+                except ApiError as e:
+                    db.execute("UPDATE files SET error=? WHERE id=?", (str(e), fid))
+                    failed += 1
+                    log(f"  could not download {rel}: {e}")
+            if finished:
                 db.commit()
-                log(f"  {done + failed}/{len(jobs)} attachments")
+            now = time.monotonic()
+            if now - last_log >= 15 or not pending:
+                last_log = now
+                speed = received[0] / max(now - started, 1e-9)
+                log(f"  {done + failed}/{len(jobs)} attachments, "
+                    f"{human(received[0])} received ({human(speed)}/s)")
+    except KeyboardInterrupt:
+        c.stop.set()  # makes the download threads stop after their current chunk
+        raise
     finally:
         ex.shutdown(wait=True, cancel_futures=True)
         db.commit()
